@@ -1,8 +1,8 @@
 import express from 'express';
 import morgan from 'morgan';
-import { nanoid } from 'nanoid';
 import { createChannel } from './amqp.js';
 import { ROUTING_KEYS } from '../common/events.js';
+import { PrismaClient } from '@prisma/client';
 
 const app = express();
 app.use(express.json());
@@ -12,8 +12,7 @@ const PORT = process.env.PORT || 3001;
 const RABBITMQ_URL = process.env.RABBITMQ_URL || 'amqp://guest:guest@localhost:5672';
 const EXCHANGE = process.env.EXCHANGE || 'app.topic';
 
-// In-memory "DB"
-const users = new Map();
+const prisma = new PrismaClient();
 
 let amqp = null;
 (async () => {
@@ -25,66 +24,75 @@ let amqp = null;
   }
 })();
 
+// Health
 app.get('/health', (req, res) => res.json({ ok: true, service: 'users' }));
 
-app.get('/', (req, res) => {
-  res.json(Array.from(users.values()));
+// Listar usuários
+app.get('/', async (req, res) => {
+  try {
+    const users = await prisma.user.findMany();
+    res.json(users);
+  } catch (err) {
+    console.error('[users] findMany error:', err.message);
+    res.status(500).json({ error: 'Erro interno' });
+  }
 });
 
+// Buscar usuário por ID
+app.get('/:id', async (req, res) => {
+  try {
+    const user = await prisma.user.findUnique({ where: { id: req.params.id } });
+    if (!user) return res.status(404).json({ error: 'not found' });
+    res.json(user);
+  } catch (err) {
+    console.error('[users] findUnique error:', err.message);
+    res.status(500).json({ error: 'Erro interno' });
+  }
+});
+
+// Criar usuário
 app.post('/', async (req, res) => {
-  const { name, email } = req.body || {};
+  const { name, email } = req.body;
   if (!name || !email) return res.status(400).json({ error: 'name and email are required' });
 
-  const id = `u_${nanoid(6)}`;
-  const user = { id, name, email, createdAt: new Date().toISOString(), updatedAt: null };
-  users.set(id, user);
-
-  // Publish event user.created
   try {
+    const user = await prisma.user.create({ data: { name, email } });
+
     if (amqp?.ch) {
-      const payload = Buffer.from(JSON.stringify(user));
-      amqp.ch.publish(EXCHANGE, ROUTING_KEYS.USER_CREATED, payload, { persistent: true });
+      amqp.ch.publish(EXCHANGE, ROUTING_KEYS.USER_CREATED, Buffer.from(JSON.stringify(user)), { persistent: true });
       console.log('[users] published event:', ROUTING_KEYS.USER_CREATED, user.id);
     }
-  } catch (err) {
-    console.error('[users] publish error:', err.message);
-  }
 
-  res.status(201).json(user);
+    res.status(201).json(user);
+  } catch (err) {
+    if (err.code === 'P2002') return res.status(400).json({ error: 'Email já existe' });
+    console.error('[users] create error:', err.message);
+    res.status(500).json({ error: 'Erro interno' });
+  }
 });
 
-// NEW: update user -> publish user.updated
+// Atualizar usuário
 app.put('/:id', async (req, res) => {
-  const id = req.params.id;
-  const existing = users.get(id);
-  if (!existing) return res.status(404).json({ error: 'not found' });
+  const { name, email } = req.body;
+  if (!name && !email) return res.status(400).json({ error: 'name or email required' });
 
-  const { name, email } = req.body || {};
-  if (!name && !email) return res.status(400).json({ error: 'name or email required to update' });
-
-  const updated = { ...existing, name: name ?? existing.name, email: email ?? existing.email, updatedAt: new Date().toISOString() };
-  users.set(id, updated);
-
-  // Publish event user.updated
   try {
+    const updatedUser = await prisma.user.update({
+      where: { id: req.params.id },
+      data: { name, email, updatedAt: new Date() }
+    });
+
     if (amqp?.ch) {
-      const payload = Buffer.from(JSON.stringify(updated));
-      amqp.ch.publish(EXCHANGE, ROUTING_KEYS.USER_UPDATED, payload, { persistent: true });
-      console.log('[users] published event:', ROUTING_KEYS.USER_UPDATED, id);
+      amqp.ch.publish(EXCHANGE, ROUTING_KEYS.USER_UPDATED, Buffer.from(JSON.stringify(updatedUser)), { persistent: true });
+      console.log('[users] published event:', ROUTING_KEYS.USER_UPDATED, updatedUser.id);
     }
+
+    res.json(updatedUser);
   } catch (err) {
-    console.error('[users] publish error:', err.message);
+    if (err.code === 'P2025') return res.status(404).json({ error: 'not found' });
+    console.error('[users] update error:', err.message);
+    res.status(500).json({ error: 'Erro interno' });
   }
-
-  res.json(updated);
 });
 
-app.get('/:id', (req, res) => {
-  const user = users.get(req.params.id);
-  if (!user) return res.status(404).json({ error: 'not found' });
-  res.json(user);
-});
-
-app.listen(PORT, () => {
-  console.log(`[users] listening on http://localhost:${PORT}`);
-});
+app.listen(PORT, () => console.log(`[users] listening on http://localhost:${PORT}`));

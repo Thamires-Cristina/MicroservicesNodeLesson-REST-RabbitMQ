@@ -1,3 +1,5 @@
+version: "3.9"
+
 services:
   rabbitmq:
     image: rabbitmq:3-management
@@ -11,21 +13,24 @@ services:
 
   users:
     build:
-      context: .                     # << agora é a raiz do projeto
+      context: .
       dockerfile: ./services/users-service/Dockerfile
     container_name: ms_users
     environment:
       PORT: 3001
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672
       EXCHANGE: app.topic
+      DATABASE_URL: file:./dev.db
     depends_on:
       - rabbitmq
     ports:
       - "3001:3001"
+    volumes:
+      - ./services/users-service/prisma:/app/prisma
 
   orders:
     build:
-      context: .                     # << agora é a raiz do projeto
+      context: .
       dockerfile: ./services/orders-service/Dockerfile
     container_name: ms_orders
     environment:
@@ -36,11 +41,15 @@ services:
       EXCHANGE: app.topic
       QUEUE: orders.q
       ROUTING_KEY_USER_CREATED: user.created
+      ROUTING_KEY_USER_UPDATED: user.updated
+      DATABASE_URL: file:./dev.db
     depends_on:
       - rabbitmq
       - users
     ports:
       - "3002:3002"
+    volumes:
+      - ./services/orders-service/prisma:/app/prisma
 
   gateway:
     build:

@@ -3,6 +3,7 @@ import morgan from 'morgan';
 import { nanoid } from 'nanoid';
 import { createChannel } from './amqp.js';
 import { ROUTING_KEYS } from '../common/events.js';
+import { PrismaClient } from '@prisma/client';
 
 const app = express();
 app.use(express.json());
@@ -17,9 +18,9 @@ const QUEUE = process.env.QUEUE || 'orders.q';
 const ROUTING_KEY_USER_CREATED = process.env.ROUTING_KEY_USER_CREATED || ROUTING_KEYS.USER_CREATED;
 const ROUTING_KEY_USER_UPDATED = process.env.ROUTING_KEY_USER_UPDATED || ROUTING_KEYS.USER_UPDATED;
 
- // In-memory "DB"
-const orders = new Map();
-// In-memory cache de usuários (preenchido por eventos)
+const prisma = new PrismaClient();
+
+// Cache de usuários populado por eventos
 const userCache = new Map();
 
 let amqp = null;
@@ -28,7 +29,6 @@ let amqp = null;
     amqp = await createChannel(RABBITMQ_URL, EXCHANGE);
     console.log('[orders] AMQP connected');
 
-    // Bind de fila para consumir eventos user.created e user.updated
     await amqp.ch.assertQueue(QUEUE, { durable: true });
     await amqp.ch.bindQueue(QUEUE, EXCHANGE, ROUTING_KEY_USER_CREATED);
     await amqp.ch.bindQueue(QUEUE, EXCHANGE, ROUTING_KEY_USER_UPDATED);
@@ -39,14 +39,13 @@ let amqp = null;
         const payload = JSON.parse(msg.content.toString());
         const key = msg.fields.routingKey;
         if (key === ROUTING_KEYS.USER_CREATED || key === ROUTING_KEYS.USER_UPDATED) {
-          // idempotência simples: atualiza/define
           userCache.set(payload.id, payload);
           console.log('[orders] consumed event', key, '-> cached', payload.id);
         }
         amqp.ch.ack(msg);
       } catch (err) {
         console.error('[orders] consume error:', err.message);
-        amqp.ch.nack(msg, false, false); // descarta em caso de erro de parsing
+        amqp.ch.nack(msg, false, false);
       }
     });
   } catch (err) {
@@ -54,82 +53,85 @@ let amqp = null;
   }
 })();
 
+// Health
 app.get('/health', (req, res) => res.json({ ok: true, service: 'orders' }));
 
-app.get('/', (req, res) => {
-  res.json(Array.from(orders.values()));
+// Listar pedidos
+app.get('/', async (req, res) => {
+  const orders = await prisma.order.findMany();
+  res.json(orders.map(o => ({ ...o, items: JSON.parse(o.items) })));
 });
 
+// Função fetch com timeout
 async function fetchWithTimeout(url, ms) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), ms);
   try {
-    const res = await fetch(url, { signal: controller.signal });
-    return res;
+    return await fetch(url, { signal: controller.signal });
   } finally {
     clearTimeout(id);
   }
 }
 
+// Criar pedido
 app.post('/', async (req, res) => {
   const { userId, items, total } = req.body || {};
   if (!userId || !Array.isArray(items) || typeof total !== 'number') {
     return res.status(400).json({ error: 'userId, items[], total<number> são obrigatórios' });
   }
 
-  // 1) Validação síncrona (HTTP) no Users Service
   try {
     const resp = await fetchWithTimeout(`${USERS_BASE_URL}/${userId}`, HTTP_TIMEOUT_MS);
     if (!resp.ok) return res.status(400).json({ error: 'usuário inválido' });
   } catch (err) {
-    console.warn('[orders] users-service timeout/failure, tentando cache...', err.message);
-    // fallback: usar cache populado por eventos (assíncrono)
-    if (!userCache.has(userId)) {
-      return res.status(503).json({ error: 'users-service indisponível e usuário não encontrado no cache' });
-    }
+    if (!userCache.has(userId)) return res.status(503).json({ error: 'users-service indisponível e usuário não encontrado no cache' });
   }
 
-  const id = `o_${nanoid(6)}`;
-  const order = { id, userId, items, total, status: 'created', createdAt: new Date().toISOString() };
-  orders.set(id, order);
-
-  // publicar evento order.created
   try {
+    const order = await prisma.order.create({
+      data: {
+        userId,
+        items: JSON.stringify(items),
+        total,
+        status: 'created'
+      }
+    });
+
     if (amqp?.ch) {
-      amqp.ch.publish(EXCHANGE, ROUTING_KEYS.ORDER_CREATED, Buffer.from(JSON.stringify(order)), { persistent: true });
+      amqp.ch.publish(EXCHANGE, ROUTING_KEYS.ORDER_CREATED, Buffer.from(JSON.stringify({ ...order, items })), { persistent: true });
       console.log('[orders] published event:', ROUTING_KEYS.ORDER_CREATED, order.id);
     }
-  } catch (err) {
-    console.error('[orders] publish error:', err.message);
-  }
 
-  res.status(201).json(order);
+    res.status(201).json({ ...order, items });
+  } catch (err) {
+    console.error('[orders] create order error:', err.message);
+    res.status(500).json({ error: 'Erro interno' });
+  }
 });
 
-// NEW: cancelar pedido -> publicar order.cancelled
-app.delete('/:id', (req, res) => {
+// Cancelar pedido
+app.delete('/:id', async (req, res) => {
   const id = req.params.id;
-  const existing = orders.get(id);
-  if (!existing) return res.status(404).json({ error: 'not found' });
 
-  existing.status = 'cancelled';
-  existing.cancelledAt = new Date().toISOString();
-  orders.set(id, existing);
-
-  // Publish event order.cancelled
   try {
+    const existing = await prisma.order.findUnique({ where: { id } });
+    if (!existing) return res.status(404).json({ error: 'not found' });
+
+    const cancelledOrder = await prisma.order.update({
+      where: { id },
+      data: { status: 'cancelled', cancelledAt: new Date() }
+    });
+
     if (amqp?.ch) {
-      amqp.ch.publish(EXCHANGE, ROUTING_KEYS.ORDER_CANCELLED, Buffer.from(JSON.stringify(existing)), { persistent: true });
+      amqp.ch.publish(EXCHANGE, ROUTING_KEYS.ORDER_CANCELLED, Buffer.from(JSON.stringify({ ...cancelledOrder, items: JSON.parse(cancelledOrder.items) })), { persistent: true });
       console.log('[orders] published event:', ROUTING_KEYS.ORDER_CANCELLED, id);
     }
+
+    res.json({ ...cancelledOrder, items: JSON.parse(cancelledOrder.items) });
   } catch (err) {
-    console.error('[orders] publish error:', err.message);
+    console.error('[orders] cancel order error:', err.message);
+    res.status(500).json({ error: 'Erro interno' });
   }
-
-  res.json(existing);
 });
 
-app.listen(PORT, () => {
-  console.log(`[orders] listening on http://localhost:${PORT}`);
-  console.log(`[orders] users base url: ${USERS_BASE_URL}`);
-});
+app.listen(PORT, () => console.log(`[orders] listening on http://localhost:${PORT}`));

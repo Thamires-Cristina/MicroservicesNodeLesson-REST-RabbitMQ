@@ -1,12 +1,12 @@
 FROM node:20-alpine
+
 WORKDIR /app
+COPY package*.json ./
+RUN npm install
+COPY . .
 
-COPY services/orders-service/package.json ./package.json
-RUN npm install --only=production
+# Gerar Prisma Client
+RUN npx prisma generate
 
-COPY services/orders-service/src ./src
-COPY common ./common
-
-ENV PORT=3002
 EXPOSE 3002
-CMD ["npm","start"]
+CMD ["node", "src/index.js"]
