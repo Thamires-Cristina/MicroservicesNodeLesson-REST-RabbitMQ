@@ -1,6 +1,5 @@
 import express from 'express';
 import morgan from 'morgan';
-import fetch from 'node-fetch';
 import { nanoid } from 'nanoid';
 import { createChannel } from './amqp.js';
 import { ROUTING_KEYS } from '../common/events.js';
@@ -16,8 +15,9 @@ const RABBITMQ_URL = process.env.RABBITMQ_URL || 'amqp://guest:guest@localhost:5
 const EXCHANGE = process.env.EXCHANGE || 'app.topic';
 const QUEUE = process.env.QUEUE || 'orders.q';
 const ROUTING_KEY_USER_CREATED = process.env.ROUTING_KEY_USER_CREATED || ROUTING_KEYS.USER_CREATED;
+const ROUTING_KEY_USER_UPDATED = process.env.ROUTING_KEY_USER_UPDATED || ROUTING_KEYS.USER_UPDATED;
 
-// In-memory "DB"
+ // In-memory "DB"
 const orders = new Map();
 // In-memory cache de usuários (preenchido por eventos)
 const userCache = new Map();
@@ -28,21 +28,25 @@ let amqp = null;
     amqp = await createChannel(RABBITMQ_URL, EXCHANGE);
     console.log('[orders] AMQP connected');
 
-    // Bind de fila para consumir eventos user.created
+    // Bind de fila para consumir eventos user.created e user.updated
     await amqp.ch.assertQueue(QUEUE, { durable: true });
     await amqp.ch.bindQueue(QUEUE, EXCHANGE, ROUTING_KEY_USER_CREATED);
+    await amqp.ch.bindQueue(QUEUE, EXCHANGE, ROUTING_KEY_USER_UPDATED);
 
     amqp.ch.consume(QUEUE, msg => {
       if (!msg) return;
       try {
-        const user = JSON.parse(msg.content.toString());
-        // idempotência simples: atualiza/define
-        userCache.set(user.id, user);
-        console.log('[orders] consumed event user.created -> cached', user.id);
+        const payload = JSON.parse(msg.content.toString());
+        const key = msg.fields.routingKey;
+        if (key === ROUTING_KEYS.USER_CREATED || key === ROUTING_KEYS.USER_UPDATED) {
+          // idempotência simples: atualiza/define
+          userCache.set(payload.id, payload);
+          console.log('[orders] consumed event', key, '-> cached', payload.id);
+        }
         amqp.ch.ack(msg);
       } catch (err) {
         console.error('[orders] consume error:', err.message);
-        amqp.ch.nack(msg, false, false); // descarta em caso de erro de parsing (aula: discutir DLQ)
+        amqp.ch.nack(msg, false, false); // descarta em caso de erro de parsing
       }
     });
   } catch (err) {
@@ -89,7 +93,7 @@ app.post('/', async (req, res) => {
   const order = { id, userId, items, total, status: 'created', createdAt: new Date().toISOString() };
   orders.set(id, order);
 
-  // (Opcional) publicar evento order.created
+  // publicar evento order.created
   try {
     if (amqp?.ch) {
       amqp.ch.publish(EXCHANGE, ROUTING_KEYS.ORDER_CREATED, Buffer.from(JSON.stringify(order)), { persistent: true });
@@ -100,6 +104,29 @@ app.post('/', async (req, res) => {
   }
 
   res.status(201).json(order);
+});
+
+// NEW: cancelar pedido -> publicar order.cancelled
+app.delete('/:id', (req, res) => {
+  const id = req.params.id;
+  const existing = orders.get(id);
+  if (!existing) return res.status(404).json({ error: 'not found' });
+
+  existing.status = 'cancelled';
+  existing.cancelledAt = new Date().toISOString();
+  orders.set(id, existing);
+
+  // Publish event order.cancelled
+  try {
+    if (amqp?.ch) {
+      amqp.ch.publish(EXCHANGE, ROUTING_KEYS.ORDER_CANCELLED, Buffer.from(JSON.stringify(existing)), { persistent: true });
+      console.log('[orders] published event:', ROUTING_KEYS.ORDER_CANCELLED, id);
+    }
+  } catch (err) {
+    console.error('[orders] publish error:', err.message);
+  }
+
+  res.json(existing);
 });
 
 app.listen(PORT, () => {

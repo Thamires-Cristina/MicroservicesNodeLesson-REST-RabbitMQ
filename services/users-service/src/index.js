@@ -36,21 +36,47 @@ app.post('/', async (req, res) => {
   if (!name || !email) return res.status(400).json({ error: 'name and email are required' });
 
   const id = `u_${nanoid(6)}`;
-  const user = { id, name, email, createdAt: new Date().toISOString() };
+  const user = { id, name, email, createdAt: new Date().toISOString(), updatedAt: null };
   users.set(id, user);
 
-  // Publish event
+  // Publish event user.created
   try {
     if (amqp?.ch) {
       const payload = Buffer.from(JSON.stringify(user));
       amqp.ch.publish(EXCHANGE, ROUTING_KEYS.USER_CREATED, payload, { persistent: true });
-      console.log('[users] published event:', ROUTING_KEYS.USER_CREATED, user);
+      console.log('[users] published event:', ROUTING_KEYS.USER_CREATED, user.id);
     }
   } catch (err) {
     console.error('[users] publish error:', err.message);
   }
 
   res.status(201).json(user);
+});
+
+// NEW: update user -> publish user.updated
+app.put('/:id', async (req, res) => {
+  const id = req.params.id;
+  const existing = users.get(id);
+  if (!existing) return res.status(404).json({ error: 'not found' });
+
+  const { name, email } = req.body || {};
+  if (!name && !email) return res.status(400).json({ error: 'name or email required to update' });
+
+  const updated = { ...existing, name: name ?? existing.name, email: email ?? existing.email, updatedAt: new Date().toISOString() };
+  users.set(id, updated);
+
+  // Publish event user.updated
+  try {
+    if (amqp?.ch) {
+      const payload = Buffer.from(JSON.stringify(updated));
+      amqp.ch.publish(EXCHANGE, ROUTING_KEYS.USER_UPDATED, payload, { persistent: true });
+      console.log('[users] published event:', ROUTING_KEYS.USER_UPDATED, id);
+    }
+  } catch (err) {
+    console.error('[users] publish error:', err.message);
+  }
+
+  res.json(updated);
 });
 
 app.get('/:id', (req, res) => {
